@@ -160,7 +160,7 @@ def calculate_write_io_stats(write_io_data):
 def calculate_storage_growth(volume_bytes_data):
     """计算存储增长（使用VolumeBytesUsed，月末减月初）"""
     if len(volume_bytes_data) < 2:
-        return "N/A", "N/A"
+        return "N/A", "N/A", "N/A", "N/A"
     
     # volume_bytes_data 现在是 [(timestamp, value), ...] 的格式，已按时间排序
     # 获取月初（最早）和月末（最晚）的数据
@@ -171,14 +171,7 @@ def calculate_storage_growth(volume_bytes_data):
     first_value_gb = first_value / (1024**3)
     last_value_gb = last_value / (1024**3)
     
-    # 计算增长量（月末 - 月初）
-    data_growth = last_value_gb - first_value_gb if last_value_gb > first_value_gb else 0
-    
-    # 计算时间差（天数）
-    time_diff = (last_timestamp - first_timestamp).days
-    avg_daily_growth = data_growth / time_diff if time_diff > 0 else 0
-    
-    return round(data_growth, 2), round(avg_daily_growth, 2)
+    return int(first_value), round(first_value_gb, 2), int(last_value), round(last_value_gb, 2)
 
 def main():
     print("Aurora Global Database 成本分析脚本")
@@ -240,7 +233,7 @@ def main():
             start_time, end_time, 'Average', period=86400  # 1天间隔
         )
         
-        cluster_data_growth, cluster_avg_daily_growth = calculate_storage_growth(cluster_volume_bytes_data)
+        cluster_storage_result = calculate_storage_growth(cluster_volume_bytes_data)
         
         # 获取集群实例
         instances = get_cluster_instances(rds_client, cluster_id)
@@ -271,8 +264,7 @@ def main():
             total_write_io, avg_daily_write_io = calculate_write_io_stats(write_io_data)
             
             # 使用集群级别的存储数据
-            data_growth = cluster_data_growth
-            avg_daily_growth = cluster_avg_daily_growth
+            start_bytes, start_gb, end_bytes, end_gb = cluster_storage_result
             
             # 保存结果
             result = {
@@ -282,15 +274,17 @@ def main():
                 '实例类型': instance['instance_class'],
                 '使用Secret Manager': '是' if uses_secret_manager else '否',
                 '30天总写IO次数': total_write_io,
-                '30天平均每日写IO': avg_daily_write_io,
-                '30天数据增长(GB)': data_growth,
-                '平均每日数据增长(GB)': avg_daily_growth
+                '月初的存储总量(原始值)': start_bytes,
+                '月初的存储总量(GB)': start_gb,
+                '月末存储总量(原始值)': end_bytes,
+                '月末的存储总量(GB)': end_gb
             }
             
             results.append(result)
             
             print(f"    写IO总数: {total_write_io:,}, 平均每日: {avg_daily_write_io:,}")
-            print(f"    数据增长: {data_growth}GB, 平均每日: {avg_daily_growth}GB")
+            print(f"    月初存储: {start_gb}GB ({start_bytes} bytes)")
+            print(f"    月末存储: {end_gb}GB ({end_bytes} bytes)")
             print()
     
     # 保存结果到CSV文件
@@ -318,15 +312,24 @@ def main():
         total_write_io_all = sum(r['30天总写IO次数'] for r in results)
         avg_daily_write_io_all = total_write_io_all // 30
         
-        # 计算总数据增长
-        valid_growth = [r['30天数据增长(GB)'] for r in results if r['30天数据增长(GB)'] != 'N/A']
-        total_data_growth = sum(valid_growth) if valid_growth else 0
+        # 计算总存储增长（去重，因为同一集群的实例共享存储数据）
+        unique_clusters = {}
+        for r in results:
+            cluster_name = r['集群名称']
+            if cluster_name not in unique_clusters:
+                start_gb = r['月初的存储总量(GB)']
+                end_gb = r['月末的存储总量(GB)']
+                if start_gb != 'N/A' and end_gb != 'N/A':
+                    unique_clusters[cluster_name] = end_gb - start_gb
+                else:
+                    unique_clusters[cluster_name] = 0
+        
+        total_storage_growth = sum(unique_clusters.values())
         
         print(f"总Aurora实例数: {total_instances}")
         print(f"30天总写IO次数: {total_write_io_all:,}")
         print(f"平均每日写IO次数: {avg_daily_write_io_all:,}")
-        print(f"30天总数据增长: {total_data_growth:.2f} GB")
-        print(f"平均每日数据增长: {total_data_growth/30:.2f} GB")
+        print(f"总存储增长: {total_storage_growth:.2f} GB")
         
         print()
         print("注意事项:")
@@ -341,9 +344,10 @@ def main():
         print("-" * 120)
         for i, result in enumerate(results[:5]):
             secret_info = f"Secret: {result['使用Secret Manager']}"
+            storage_info = f"存储: {result['月初的存储总量(GB)']}GB -> {result['月末的存储总量(GB)']}GB"
             print(f"{i+1}. {result['集群名称']}/{result['实例ID']} - "
                   f"写IO: {result['30天总写IO次数']:,}, "
-                  f"数据增长: {result['30天数据增长(GB)']}GB, "
+                  f"{storage_info}, "
                   f"{secret_info}")
         
         if len(results) > 5:
