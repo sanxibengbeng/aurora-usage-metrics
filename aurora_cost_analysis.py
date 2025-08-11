@@ -63,7 +63,35 @@ def get_cluster_instances(rds_client, cluster_id):
         print(f"错误获取实例信息: {e}")
         return []
 
-def get_metric_data(cloudwatch_client, metric_name, instance_id, start_time, end_time, statistic='Sum'):
+def get_cluster_metric_data(cloudwatch_client, metric_name, cluster_id, start_time, end_time, statistic='Average', period=86400):
+    """从CloudWatch获取集群级别的指标数据"""
+    try:
+        response = cloudwatch_client.get_metric_statistics(
+            Namespace='AWS/RDS',
+            MetricName=metric_name,
+            Dimensions=[
+                {
+                    'Name': 'DBClusterIdentifier',
+                    'Value': cluster_id
+                }
+            ],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=period,
+            Statistics=[statistic]
+        )
+        
+        if response['Datapoints']:
+            # 按时间排序
+            sorted_datapoints = sorted(response['Datapoints'], key=lambda x: x['Timestamp'])
+            return [(point['Timestamp'], point[statistic]) for point in sorted_datapoints]
+        return []
+        
+    except ClientError as e:
+        print(f"错误获取集群指标 {metric_name} for {cluster_id}: {e}")
+        return []
+
+def get_metric_data(cloudwatch_client, metric_name, instance_id, start_time, end_time, statistic='Sum', period=86400):
     """从CloudWatch获取指标数据"""
     try:
         response = cloudwatch_client.get_metric_statistics(
@@ -77,12 +105,40 @@ def get_metric_data(cloudwatch_client, metric_name, instance_id, start_time, end
             ],
             StartTime=start_time,
             EndTime=end_time,
-            Period=86400,  # 1天
+            Period=period,
             Statistics=[statistic]
         )
         
         if response['Datapoints']:
-            return [point[statistic] for point in response['Datapoints']]
+            # 按时间排序
+            sorted_datapoints = sorted(response['Datapoints'], key=lambda x: x['Timestamp'])
+            return [(point['Timestamp'], point[statistic]) for point in sorted_datapoints]
+        return []
+        
+    except ClientError as e:
+        print(f"错误获取指标 {metric_name} for {instance_id}: {e}")
+        return []
+    """从CloudWatch获取指标数据"""
+    try:
+        response = cloudwatch_client.get_metric_statistics(
+            Namespace='AWS/RDS',
+            MetricName=metric_name,
+            Dimensions=[
+                {
+                    'Name': 'DBInstanceIdentifier',
+                    'Value': instance_id
+                }
+            ],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=period,
+            Statistics=[statistic]
+        )
+        
+        if response['Datapoints']:
+            # 按时间排序
+            sorted_datapoints = sorted(response['Datapoints'], key=lambda x: x['Timestamp'])
+            return [(point['Timestamp'], point[statistic]) for point in sorted_datapoints]
         return []
         
     except ClientError as e:
@@ -90,29 +146,37 @@ def get_metric_data(cloudwatch_client, metric_name, instance_id, start_time, end
         return []
 
 def calculate_write_io_stats(write_io_data):
-    """计算写IO统计"""
+    """计算写IO统计 - 累加所有时间间隔的值"""
     if not write_io_data:
         return 0, 0
     
-    total_write_io = sum(write_io_data)
+    # write_io_data 现在是 [(timestamp, value), ...] 的格式
+    # 累加所有间隔的写IO值
+    total_write_io = sum(value for timestamp, value in write_io_data)
     avg_daily_write_io = total_write_io / len(write_io_data) if write_io_data else 0
     
     return int(total_write_io), int(avg_daily_write_io)
 
-def calculate_storage_growth(free_storage_data):
-    """计算存储增长（通过空闲存储空间变化估算）"""
-    if len(free_storage_data) < 2:
+def calculate_storage_growth(volume_bytes_data):
+    """计算存储增长（使用VolumeBytesUsed，月末减月初）"""
+    if len(volume_bytes_data) < 2:
         return "N/A", "N/A"
     
+    # volume_bytes_data 现在是 [(timestamp, value), ...] 的格式，已按时间排序
+    # 获取月初（最早）和月末（最晚）的数据
+    first_timestamp, first_value = volume_bytes_data[0]  # 月初
+    last_timestamp, last_value = volume_bytes_data[-1]   # 月末
+    
     # 转换为GB
-    storage_gb = [bytes_val / (1024**3) for bytes_val in free_storage_data]
+    first_value_gb = first_value / (1024**3)
+    last_value_gb = last_value / (1024**3)
     
-    # 计算增长量（空闲空间减少 = 数据增长）
-    first_free = max(storage_gb)  # 最大空闲空间
-    last_free = min(storage_gb)   # 最小空闲空间
+    # 计算增长量（月末 - 月初）
+    data_growth = last_value_gb - first_value_gb if last_value_gb > first_value_gb else 0
     
-    data_growth = first_free - last_free if first_free > last_free else 0
-    avg_daily_growth = data_growth / 30
+    # 计算时间差（天数）
+    time_diff = (last_timestamp - first_timestamp).days
+    avg_daily_growth = data_growth / time_diff if time_diff > 0 else 0
     
     return round(data_growth, 2), round(avg_daily_growth, 2)
 
@@ -170,6 +234,15 @@ def main():
         else:
             print(f"  使用Secret Manager: 否")
         
+        # 获取集群级别的存储数据
+        print("  查询集群存储使用数据...")
+        cluster_volume_bytes_data = get_cluster_metric_data(
+            cloudwatch_client, 'VolumeBytesUsed', cluster_id,
+            start_time, end_time, 'Average', period=86400  # 1天间隔
+        )
+        
+        cluster_data_growth, cluster_avg_daily_growth = calculate_storage_growth(cluster_volume_bytes_data)
+        
         # 获取集群实例
         instances = get_cluster_instances(rds_client, cluster_id)
         
@@ -181,23 +254,26 @@ def main():
             instance_id = instance['identifier']
             print(f"  分析实例: {instance_id}")
             
-            # 获取写IO数据
+            # 获取写IO数据 - 先尝试VolumeWriteIOPS，如果没有数据则尝试WriteIOPS
             print("    查询写IO数据...")
             write_io_data = get_metric_data(
-                cloudwatch_client, 'WriteIOPS', instance_id, 
-                start_time, end_time, 'Sum'
+                cloudwatch_client, 'VolumeWriteIOPS', instance_id, 
+                start_time, end_time, 'Sum', period=3600  # 1小时间隔
             )
+            
+            # 如果VolumeWriteIOPS没有数据，尝试WriteIOPS
+            if not write_io_data:
+                print("    VolumeWriteIOPS无数据，尝试WriteIOPS...")
+                write_io_data = get_metric_data(
+                    cloudwatch_client, 'WriteIOPS', instance_id, 
+                    start_time, end_time, 'Sum', period=3600  # 1小时间隔
+                )
             
             total_write_io, avg_daily_write_io = calculate_write_io_stats(write_io_data)
             
-            # 获取存储数据
-            print("    查询存储使用数据...")
-            free_storage_data = get_metric_data(
-                cloudwatch_client, 'FreeStorageSpace', instance_id,
-                start_time, end_time, 'Average'
-            )
-            
-            data_growth, avg_daily_growth = calculate_storage_growth(free_storage_data)
+            # 使用集群级别的存储数据
+            data_growth = cluster_data_growth
+            avg_daily_growth = cluster_avg_daily_growth
             
             # 保存结果
             result = {
@@ -256,9 +332,9 @@ def main():
         
         print()
         print("注意事项:")
-        print("1. 数据增长量通过FreeStorageSpace变化估算，可能不够精确")
-        print("2. 建议结合Aurora的实际存储使用量进行验证")
-        print("3. Global Database的跨区域复制会产生额外的写IO成本")
+        print("1. 写IO统计：使用VolumeWriteIOPS指标，按小时间隔累加所有时间段的写IO次数")
+        print("2. 数据增长计算：使用VolumeBytesUsed指标，计算月末与月初数值的差值")
+        print("3. Global Database成本：跨区域复制会产生额外的写IO成本")
         print("4. 可以使用AWS Pricing Calculator进一步估算成本: https://calculator.aws")
         
         # 显示前几行数据

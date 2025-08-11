@@ -13,8 +13,9 @@
 
 - 自动获取当前region（适合CloudShell环境）
 - 查询所有Aurora集群和实例
-- 统计过去30天的写IO次数
-- 估算数据增长量
+- 统计过去30天的写IO次数（VolumeWriteIOPS累加）
+- 计算数据增长量（VolumeBytesUsed月末减月初）
+- 检测Secret Manager使用情况
 - 生成CSV格式的详细报告
 - 提供汇总统计信息
 
@@ -52,10 +53,11 @@ CSV文件包含以下列：
 
 ## 注意事项
 
-1. **数据增长估算**：通过FreeStorageSpace的变化来估算数据增长，可能不够精确
-2. **Global Database成本**：跨区域复制会产生额外的写IO成本
-3. **时间范围**：查询过去30天的数据，如果实例创建时间少于30天，数据可能不完整
-4. **CloudWatch延迟**：CloudWatch指标可能有延迟，最新的数据可能不可用
+1. **写IO统计**：使用VolumeWriteIOPS指标，按小时间隔累加所有时间段的写IO次数
+2. **数据增长计算**：使用VolumeBytesUsed指标，计算月末与月初数值的差值
+3. **Global Database成本**：跨区域复制会产生额外的写IO成本
+4. **时间范围**：查询过去30天的数据，如果实例创建时间少于30天，数据可能不完整
+5. **CloudWatch延迟**：CloudWatch指标可能有延迟，最新的数据可能不可用
 
 ## 成本估算建议
 
