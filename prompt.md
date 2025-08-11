@@ -1,0 +1,1 @@
+我要估算aurora global database的成本，需要统计 aurora所有实例的进30天的write io和每日新增数据量。用aws cli 从 cloud watch查询相关数据，并输出列表。 脚本要支持cloudshell运行，不指定region，从cloudshell运行环境获取当前region。
