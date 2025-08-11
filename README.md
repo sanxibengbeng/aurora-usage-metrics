@@ -4,8 +4,7 @@
 
 ## 文件说明
 
-- `aurora_cost_analysis.sh` - Bash版本脚本
-- `aurora_cost_analysis.py` - Python版本脚本（推荐）
+- `aurora_cost_analysis.py` - Python脚本
 - `README.md` - 使用说明
 
 ## 功能特性
@@ -21,15 +20,9 @@
 
 ### 在CloudShell中运行
 
-1. **Python版本（推荐）**：
-   ```bash
-   python3 aurora_cost_analysis.py
-   ```
-
-2. **Bash版本**：
-   ```bash
-   ./aurora_cost_analysis.sh
-   ```
+```bash
+python3 aurora_cost_analysis.py
+```
 
 ### 输出文件
 
