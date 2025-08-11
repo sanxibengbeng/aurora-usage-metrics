@@ -7,7 +7,7 @@ Aurora Global Database 成本分析脚本
 import boto3
 import json
 import csv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import sys
 from botocore.exceptions import ClientError, NoCredentialsError
 
@@ -27,10 +27,16 @@ def get_aurora_clusters(rds_client):
         
         for cluster in response['DBClusters']:
             if cluster['Engine'] in ['aurora-mysql', 'aurora-postgresql']:
+                # 检查是否使用了Secret Manager
+                uses_secret_manager = bool(cluster.get('MasterUserSecret'))
+                secret_arn = cluster.get('MasterUserSecret', {}).get('SecretArn', '') if uses_secret_manager else ''
+                
                 aurora_clusters.append({
                     'identifier': cluster['DBClusterIdentifier'],
                     'engine': cluster['Engine'],
-                    'engine_version': cluster['EngineVersion']
+                    'engine_version': cluster['EngineVersion'],
+                    'uses_secret_manager': uses_secret_manager,
+                    'secret_arn': secret_arn
                 })
         
         return aurora_clusters
@@ -131,7 +137,7 @@ def main():
         sys.exit(1)
     
     # 计算时间范围（过去30天）
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=30)
     
     print(f"查询时间范围: {start_time.strftime('%Y-%m-%d %H:%M:%S')} 到 {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -154,7 +160,15 @@ def main():
     # 分析每个集群
     for cluster in clusters:
         cluster_id = cluster['identifier']
+        uses_secret_manager = cluster['uses_secret_manager']
+        secret_arn = cluster['secret_arn']
+        
         print(f"分析集群: {cluster_id} ({cluster['engine']})")
+        if uses_secret_manager:
+            print(f"  使用Secret Manager: 是")
+            print(f"  Secret ARN: {secret_arn}")
+        else:
+            print(f"  使用Secret Manager: 否")
         
         # 获取集群实例
         instances = get_cluster_instances(rds_client, cluster_id)
@@ -191,6 +205,8 @@ def main():
                 '实例ID': instance_id,
                 '引擎': instance['engine'],
                 '实例类型': instance['instance_class'],
+                '使用Secret Manager': '是' if uses_secret_manager else '否',
+                'Secret ARN': secret_arn if uses_secret_manager else '',
                 '30天总写IO次数': total_write_io,
                 '30天平均每日写IO': avg_daily_write_io,
                 '30天数据增长(GB)': data_growth,
@@ -248,11 +264,13 @@ def main():
         # 显示前几行数据
         print()
         print("数据预览:")
-        print("-" * 100)
+        print("-" * 120)
         for i, result in enumerate(results[:5]):
+            secret_info = f"Secret: {result['使用Secret Manager']}" if result['使用Secret Manager'] == '否' else f"Secret: {result['使用Secret Manager']} (ARN已记录)"
             print(f"{i+1}. {result['集群名称']}/{result['实例ID']} - "
                   f"写IO: {result['30天总写IO次数']:,}, "
-                  f"数据增长: {result['30天数据增长(GB)']}GB")
+                  f"数据增长: {result['30天数据增长(GB)']}GB, "
+                  f"{secret_info}")
         
         if len(results) > 5:
             print(f"... 还有 {len(results) - 5} 个实例")

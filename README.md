@@ -5,7 +5,9 @@
 ## 文件说明
 
 - `aurora_cost_analysis.py` - Python脚本
+- `run_analysis.sh` - 启动脚本（自动处理虚拟环境）
 - `README.md` - 使用说明
+- `.gitignore` - Git忽略文件配置
 
 ## 功能特性
 
@@ -33,6 +35,8 @@ CSV文件包含以下列：
 - 实例ID
 - 引擎类型
 - 实例类型
+- 使用Secret Manager
+- Secret ARN
 - 30天总写IO次数
 - 30天平均每日写IO
 - 30天数据增长(GB)
