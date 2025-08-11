@@ -37,7 +37,6 @@ CSV文件包含以下列：
 - 引擎类型
 - 实例类型
 - 使用Secret Manager
-- Secret ARN
 - 30天总写IO次数
 - 30天平均每日写IO
 - 30天数据增长(GB)

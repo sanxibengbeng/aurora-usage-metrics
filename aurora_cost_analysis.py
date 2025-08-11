@@ -230,7 +230,6 @@ def main():
         print(f"分析集群: {cluster_id} ({cluster['engine']})")
         if uses_secret_manager:
             print(f"  使用Secret Manager: 是")
-            print(f"  Secret ARN: {secret_arn}")
         else:
             print(f"  使用Secret Manager: 否")
         
@@ -282,7 +281,6 @@ def main():
                 '引擎': instance['engine'],
                 '实例类型': instance['instance_class'],
                 '使用Secret Manager': '是' if uses_secret_manager else '否',
-                'Secret ARN': secret_arn if uses_secret_manager else '',
                 '30天总写IO次数': total_write_io,
                 '30天平均每日写IO': avg_daily_write_io,
                 '30天数据增长(GB)': data_growth,
@@ -342,7 +340,7 @@ def main():
         print("数据预览:")
         print("-" * 120)
         for i, result in enumerate(results[:5]):
-            secret_info = f"Secret: {result['使用Secret Manager']}" if result['使用Secret Manager'] == '否' else f"Secret: {result['使用Secret Manager']} (ARN已记录)"
+            secret_info = f"Secret: {result['使用Secret Manager']}"
             print(f"{i+1}. {result['集群名称']}/{result['实例ID']} - "
                   f"写IO: {result['30天总写IO次数']:,}, "
                   f"数据增长: {result['30天数据增长(GB)']}GB, "
