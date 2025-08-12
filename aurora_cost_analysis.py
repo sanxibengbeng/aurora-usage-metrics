@@ -2,6 +2,7 @@
 """
 Aurora Global Database 成本分析脚本
 查询过去30天的Write IO和数据增长量
+支持Aurora集群和RDS实例
 """
 
 import boto3
@@ -9,6 +10,7 @@ import json
 import csv
 from datetime import datetime, timedelta, timezone
 import sys
+import hashlib
 from botocore.exceptions import ClientError, NoCredentialsError
 
 def get_current_region():
@@ -19,44 +21,98 @@ def get_current_region():
     except Exception:
         return None
 
+def mask_identifier(identifier):
+    """对数据库标识符进行脱敏处理"""
+    if not identifier:
+        return "N/A"
+    
+    # 使用SHA256哈希的前8位作为脱敏标识符
+    hash_object = hashlib.sha256(identifier.encode())
+    hash_hex = hash_object.hexdigest()
+    return f"db-{hash_hex[:8]}"
+
 def get_aurora_clusters(rds_client):
-    """获取所有Aurora集群"""
+    """获取所有Aurora集群（支持分页）"""
     try:
-        response = rds_client.describe_db_clusters()
         aurora_clusters = []
+        paginator = rds_client.get_paginator('describe_db_clusters')
         
-        for cluster in response['DBClusters']:
-            if cluster['Engine'] in ['aurora-mysql', 'aurora-postgresql']:
-                # 检查是否使用了Secret Manager
-                uses_secret_manager = bool(cluster.get('MasterUserSecret'))
-                secret_arn = cluster.get('MasterUserSecret', {}).get('SecretArn', '') if uses_secret_manager else ''
-                
-                aurora_clusters.append({
-                    'identifier': cluster['DBClusterIdentifier'],
-                    'engine': cluster['Engine'],
-                    'engine_version': cluster['EngineVersion'],
-                    'uses_secret_manager': uses_secret_manager,
-                    'secret_arn': secret_arn
-                })
+        for page in paginator.paginate():
+            for cluster in page['DBClusters']:
+                if cluster['Engine'] in ['aurora-mysql', 'aurora-postgresql']:
+                    # 检查是否使用了Secret Manager
+                    uses_secret_manager = bool(cluster.get('MasterUserSecret'))
+                    secret_arn = cluster.get('MasterUserSecret', {}).get('SecretArn', '') if uses_secret_manager else ''
+                    
+                    aurora_clusters.append({
+                        'identifier': cluster['DBClusterIdentifier'],
+                        'masked_identifier': mask_identifier(cluster['DBClusterIdentifier']),
+                        'engine': cluster['Engine'],
+                        'engine_version': cluster['EngineVersion'],
+                        'uses_secret_manager': uses_secret_manager,
+                        'secret_arn': secret_arn,
+                        'type': 'Aurora集群'
+                    })
         
         return aurora_clusters
     except ClientError as e:
         print(f"错误获取Aurora集群: {e}")
         return []
 
-def get_cluster_instances(rds_client, cluster_id):
-    """获取集群中的实例"""
+def get_rds_instances(rds_client):
+    """获取所有RDS实例（非Aurora）"""
     try:
-        response = rds_client.describe_db_instances()
-        instances = []
+        rds_instances = []
+        paginator = rds_client.get_paginator('describe_db_instances')
         
-        for instance in response['DBInstances']:
-            if instance.get('DBClusterIdentifier') == cluster_id:
-                instances.append({
-                    'identifier': instance['DBInstanceIdentifier'],
-                    'instance_class': instance['DBInstanceClass'],
-                    'engine': instance['Engine']
-                })
+        for page in paginator.paginate():
+            for instance in page['DBInstances']:
+                # 只获取非Aurora的RDS实例（没有DBClusterIdentifier的实例）
+                if not instance.get('DBClusterIdentifier'):
+                    # 检查是否使用了Secret Manager
+                    uses_secret_manager = bool(instance.get('MasterUserSecret'))
+                    
+                    rds_instances.append({
+                        'identifier': instance['DBInstanceIdentifier'],
+                        'masked_identifier': mask_identifier(instance['DBInstanceIdentifier']),
+                        'engine': instance['Engine'],
+                        'engine_version': instance['EngineVersion'],
+                        'instance_class': instance['DBInstanceClass'],
+                        'uses_secret_manager': uses_secret_manager,
+                        'type': 'RDS实例'
+                    })
+        
+        return rds_instances
+    except ClientError as e:
+        print(f"错误获取RDS实例: {e}")
+        return []
+
+def get_cluster_instances(rds_client, cluster_id):
+    """获取集群中的实例（支持分页）"""
+    try:
+        instances = []
+        paginator = rds_client.get_paginator('describe_db_instances')
+        
+        # 首先获取集群信息来获取成员角色信息
+        cluster_info = rds_client.describe_db_clusters(DBClusterIdentifier=cluster_id)
+        cluster_members = {}
+        if cluster_info['DBClusters']:
+            for member in cluster_info['DBClusters'][0].get('DBClusterMembers', []):
+                cluster_members[member['DBInstanceIdentifier']] = "Writer" if member['IsClusterWriter'] else "Reader"
+        
+        for page in paginator.paginate():
+            for instance in page['DBInstances']:
+                if instance.get('DBClusterIdentifier') == cluster_id:
+                    instance_id = instance['DBInstanceIdentifier']
+                    instance_role = cluster_members.get(instance_id, "Unknown")
+                    
+                    instances.append({
+                        'identifier': instance['DBInstanceIdentifier'],
+                        'masked_identifier': mask_identifier(instance['DBInstanceIdentifier']),
+                        'instance_class': instance['DBInstanceClass'],
+                        'engine': instance['Engine'],
+                        'role': instance_role
+                    })
         
         return instances
     except ClientError as e:
@@ -118,32 +174,6 @@ def get_metric_data(cloudwatch_client, metric_name, instance_id, start_time, end
     except ClientError as e:
         print(f"错误获取指标 {metric_name} for {instance_id}: {e}")
         return []
-    """从CloudWatch获取指标数据"""
-    try:
-        response = cloudwatch_client.get_metric_statistics(
-            Namespace='AWS/RDS',
-            MetricName=metric_name,
-            Dimensions=[
-                {
-                    'Name': 'DBInstanceIdentifier',
-                    'Value': instance_id
-                }
-            ],
-            StartTime=start_time,
-            EndTime=end_time,
-            Period=period,
-            Statistics=[statistic]
-        )
-        
-        if response['Datapoints']:
-            # 按时间排序
-            sorted_datapoints = sorted(response['Datapoints'], key=lambda x: x['Timestamp'])
-            return [(point['Timestamp'], point[statistic]) for point in sorted_datapoints]
-        return []
-        
-    except ClientError as e:
-        print(f"错误获取指标 {metric_name} for {instance_id}: {e}")
-        return []
 
 def calculate_write_io_stats(write_io_data):
     """计算写IO统计 - 累加所有时间间隔的值"""
@@ -174,7 +204,7 @@ def calculate_storage_growth(volume_bytes_data):
     return int(first_value), round(first_value_gb, 2), int(last_value), round(last_value_gb, 2)
 
 def main():
-    print("Aurora Global Database 成本分析脚本")
+    print("Aurora & RDS 数据库成本分析脚本")
     print("=" * 50)
     
     # 获取当前region
@@ -200,27 +230,30 @@ def main():
     print(f"查询时间范围: {start_time.strftime('%Y-%m-%d %H:%M:%S')} 到 {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print()
     
-    # 获取Aurora集群
-    print("正在获取Aurora集群列表...")
-    clusters = get_aurora_clusters(rds_client)
+    # 获取Aurora集群和RDS实例
+    print("正在获取数据库列表...")
+    aurora_clusters = get_aurora_clusters(rds_client)
+    rds_instances = get_rds_instances(rds_client)
     
-    if not clusters:
-        print("未找到Aurora集群")
+    if not aurora_clusters and not rds_instances:
+        print("未找到Aurora集群或RDS实例")
         sys.exit(0)
     
-    print(f"找到 {len(clusters)} 个Aurora集群")
+    print(f"找到 {len(aurora_clusters)} 个Aurora集群")
+    print(f"找到 {len(rds_instances)} 个RDS实例")
     print()
     
     # 准备结果数据
     results = []
     
-    # 分析每个集群
-    for cluster in clusters:
+    # 分析Aurora集群
+    for cluster in aurora_clusters:
         cluster_id = cluster['identifier']
+        masked_cluster_id = cluster['masked_identifier']
         uses_secret_manager = cluster['uses_secret_manager']
         secret_arn = cluster['secret_arn']
         
-        print(f"分析集群: {cluster_id} ({cluster['engine']})")
+        print(f"分析Aurora集群: {masked_cluster_id} ({cluster['engine']})")
         if uses_secret_manager:
             print(f"  使用Secret Manager: 是")
         else:
@@ -239,12 +272,14 @@ def main():
         instances = get_cluster_instances(rds_client, cluster_id)
         
         if not instances:
-            print(f"  集群 {cluster_id} 中未找到实例")
+            print(f"  集群 {masked_cluster_id} 中未找到实例")
             continue
         
         for instance in instances:
             instance_id = instance['identifier']
-            print(f"  分析实例: {instance_id}")
+            masked_instance_id = instance['masked_identifier']
+            instance_role = instance['role']
+            print(f"  分析实例: {masked_instance_id} (角色: {instance_role})")
             
             # 获取写IO数据 - 先尝试VolumeWriteIOPS，如果没有数据则尝试WriteIOPS
             print("    查询写IO数据...")
@@ -268,8 +303,10 @@ def main():
             
             # 保存结果
             result = {
-                '集群名称': cluster_id,
-                '实例ID': instance_id,
+                '数据库类型': cluster['type'],
+                '集群/实例名称': masked_cluster_id,
+                '实例ID': masked_instance_id,
+                '实例角色': instance_role,
                 '引擎': instance['engine'],
                 '实例类型': instance['instance_class'],
                 '使用Secret Manager': '是' if uses_secret_manager else '否',
@@ -287,9 +324,63 @@ def main():
             print(f"    月末存储: {end_gb}GB ({end_bytes} bytes)")
             print()
     
+    # 分析RDS实例
+    for rds_instance in rds_instances:
+        instance_id = rds_instance['identifier']
+        masked_instance_id = rds_instance['masked_identifier']
+        uses_secret_manager = rds_instance['uses_secret_manager']
+        
+        print(f"分析RDS实例: {masked_instance_id} ({rds_instance['engine']})")
+        if uses_secret_manager:
+            print(f"  使用Secret Manager: 是")
+        else:
+            print(f"  使用Secret Manager: 否")
+        
+        # 获取写IO数据
+        print("  查询写IO数据...")
+        write_io_data = get_metric_data(
+            cloudwatch_client, 'WriteIOPS', instance_id, 
+            start_time, end_time, 'Sum', period=3600  # 1小时间隔
+        )
+        
+        total_write_io, avg_daily_write_io = calculate_write_io_stats(write_io_data)
+        
+        # 获取存储数据 - RDS实例使用DatabaseConnections或其他可用指标
+        print("  查询存储使用数据...")
+        # 对于RDS实例，我们尝试获取FreeStorageSpace来计算已用存储
+        free_storage_data = get_metric_data(
+            cloudwatch_client, 'FreeStorageSpace', instance_id,
+            start_time, end_time, 'Average', period=86400  # 1天间隔
+        )
+        
+        # 由于RDS实例的存储计算比较复杂，我们暂时设置为N/A
+        start_bytes, start_gb, end_bytes, end_gb = "N/A", "N/A", "N/A", "N/A"
+        
+        # 保存结果
+        result = {
+            '数据库类型': rds_instance['type'],
+            '集群/实例名称': masked_instance_id,
+            '实例ID': masked_instance_id,
+            '实例角色': 'Standalone',
+            '引擎': rds_instance['engine'],
+            '实例类型': rds_instance['instance_class'],
+            '使用Secret Manager': '是' if uses_secret_manager else '否',
+            '30天总写IO次数': total_write_io,
+            '月初的存储总量(原始值)': start_bytes,
+            '月初的存储总量(GB)': start_gb,
+            '月末存储总量(原始值)': end_bytes,
+            '月末的存储总量(GB)': end_gb
+        }
+        
+        results.append(result)
+        
+        print(f"  写IO总数: {total_write_io:,}, 平均每日: {avg_daily_write_io:,}")
+        print(f"  存储信息: RDS实例存储信息暂不支持")
+        print()
+    
     # 保存结果到CSV文件
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    csv_filename = f'aurora_cost_analysis_{timestamp}.csv'
+    csv_filename = f'aurora_rds_cost_analysis_{timestamp}.csv'
     
     if results:
         with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
@@ -309,34 +400,40 @@ def main():
         print("=" * 30)
         
         total_instances = len(results)
+        aurora_instances = len([r for r in results if r['数据库类型'] == 'Aurora集群'])
+        rds_instances_count = len([r for r in results if r['数据库类型'] == 'RDS实例'])
         total_write_io_all = sum(r['30天总写IO次数'] for r in results)
-        avg_daily_write_io_all = total_write_io_all // 30
+        avg_daily_write_io_all = total_write_io_all // 30 if total_write_io_all > 0 else 0
         
         # 计算总存储增长（去重，因为同一集群的实例共享存储数据）
         unique_clusters = {}
         for r in results:
-            cluster_name = r['集群名称']
-            if cluster_name not in unique_clusters:
-                start_gb = r['月初的存储总量(GB)']
-                end_gb = r['月末的存储总量(GB)']
-                if start_gb != 'N/A' and end_gb != 'N/A':
-                    unique_clusters[cluster_name] = end_gb - start_gb
-                else:
-                    unique_clusters[cluster_name] = 0
+            if r['数据库类型'] == 'Aurora集群':
+                cluster_name = r['集群/实例名称']
+                if cluster_name not in unique_clusters:
+                    start_gb = r['月初的存储总量(GB)']
+                    end_gb = r['月末的存储总量(GB)']
+                    if start_gb != 'N/A' and end_gb != 'N/A':
+                        unique_clusters[cluster_name] = end_gb - start_gb
+                    else:
+                        unique_clusters[cluster_name] = 0
         
         total_storage_growth = sum(unique_clusters.values())
         
-        print(f"总Aurora实例数: {total_instances}")
+        print(f"总数据库实例数: {total_instances}")
+        print(f"  - Aurora实例: {aurora_instances}")
+        print(f"  - RDS实例: {rds_instances_count}")
         print(f"30天总写IO次数: {total_write_io_all:,}")
         print(f"平均每日写IO次数: {avg_daily_write_io_all:,}")
-        print(f"总存储增长: {total_storage_growth:.2f} GB")
+        print(f"Aurora总存储增长: {total_storage_growth:.2f} GB")
         
         print()
         print("注意事项:")
-        print("1. 写IO统计：使用VolumeWriteIOPS指标，按小时间隔累加所有时间段的写IO次数")
-        print("2. 数据增长计算：使用VolumeBytesUsed指标，计算月末与月初数值的差值")
-        print("3. Global Database成本：跨区域复制会产生额外的写IO成本")
-        print("4. 可以使用AWS Pricing Calculator进一步估算成本: https://calculator.aws")
+        print("1. 所有数据库标识符已脱敏处理")
+        print("2. 写IO统计：Aurora使用VolumeWriteIOPS，RDS使用WriteIOPS指标")
+        print("3. 存储增长：仅支持Aurora集群，RDS实例暂不支持")
+        print("4. Global Database成本：跨区域复制会产生额外的写IO成本")
+        print("5. 可以使用AWS Pricing Calculator进一步估算成本: https://calculator.aws")
         
         # 显示前几行数据
         print()
@@ -345,16 +442,18 @@ def main():
         for i, result in enumerate(results[:5]):
             secret_info = f"Secret: {result['使用Secret Manager']}"
             storage_info = f"存储: {result['月初的存储总量(GB)']}GB -> {result['月末的存储总量(GB)']}GB"
-            print(f"{i+1}. {result['集群名称']}/{result['实例ID']} - "
+            role_info = f"角色: {result['实例角色']}"
+            print(f"{i+1}. {result['数据库类型']} - {result['集群/实例名称']}/{result['实例ID']} - "
                   f"写IO: {result['30天总写IO次数']:,}, "
                   f"{storage_info}, "
+                  f"{role_info}, "
                   f"{secret_info}")
         
         if len(results) > 5:
             print(f"... 还有 {len(results) - 5} 个实例")
     
     else:
-        print("未找到任何Aurora实例数据")
+        print("未找到任何数据库实例数据")
 
 if __name__ == "__main__":
     main()
